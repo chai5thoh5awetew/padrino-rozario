@@ -369,6 +369,254 @@ class Product < ActiveRecord::Base
       if i = sd_cat_ls.size - 1; return true; end
     }
   end
+
+  # ========== ОПТИМИЗИРОВАННЫЕ МЕТОДЫ ДЛЯ ПРОИЗВОДИТЕЛЬНОСТИ ==========
+  # Добавлены для решения проблем с N+1 запросами и медленными операциями
+  
+  # КРИТИЧЕСКИ ВАЖНЫЙ: Заменяет медленный get_catalog с N+1 проблемами
+  def self.get_catalog_optimized(subdomain, subdomain_pool, categories=nil, tags=nil, min_price=0, max_price=1_000_000, sort_by=nil, limit=nil, offset=0)
+    # Кэшируем результат на 10 минут для популярных запросов
+    cache_key = "catalog_opt_#{subdomain.id}_#{subdomain_pool.id}_#{categories&.map(&:id)&.join('_')}_#{tags&.map(&:id)&.join('_')}_#{min_price}_#{max_price}_#{sort_by}_#{limit}_#{offset}"
+    
+    Padrino.cache(cache_key, expires_in: 600) do # 10 минут
+      get_catalog_data(subdomain, subdomain_pool, categories, tags, min_price, max_price, sort_by, limit, offset)
+    end
+  end
+  
+  # Основная логика получения каталога с оптимизированными запросами
+  def self.get_catalog_data(subdomain, subdomain_pool, categories, tags, min_price, max_price, sort_by, limit, offset)
+    # Строим базовый запрос с joins вместо отдельных запросов
+    query = Product.joins(:categories)
+                  .includes(:categories, :tags, :product_complects)
+                  .distinct
+    
+    # Фильтр по категориям субдомена
+    if subdomain && subdomain.categories.any?
+      query = query.where(categories: {id: subdomain.categories.pluck(:id)})
+    end
+    
+    # Фильтр по категориям субдомен пула
+    if subdomain_pool && subdomain_pool.categories.any?
+      query = query.where(categories: {id: subdomain_pool.categories.pluck(:id)})
+    end
+    
+    # Фильтр по конкретным категориям
+    if categories && categories.any?
+      query = query.where(categories: {id: categories.map(&:id)})
+    end
+    
+    # Фильтр по тегам
+    if tags && tags.any?
+      query = query.joins(:tags).where(tags: {id: tags.map(&:id)})
+    end
+    
+    # Получаем продукты одним запросом
+    products_array = query.to_a
+    
+    # Пакетная обработка цен вместо N+1
+    products_with_prices = calculate_batch_prices(products_array, subdomain, subdomain_pool, categories)
+    
+    # Фильтр по цене (после расчета цен)
+    filtered_products = products_with_prices.select do |product_data|
+      price = product_data[:calculated_price] || 0
+      price >= min_price && price <= max_price
+    end
+    
+    # Сортировка
+    sorted_products = apply_sorting(filtered_products, sort_by)
+    
+    # Пагинация
+    if limit
+      sorted_products = sorted_products.drop(offset).take(limit)
+    end
+    
+    sorted_products
+  end
+  
+  # Пакетный расчет цен для массива продуктов - устраняет N+1 проблему
+  def self.calculate_batch_prices(products_array, subdomain, subdomain_pool, categories)
+    return [] if products_array.empty?
+    
+    product_ids = products_array.map(&:id)
+    
+    # Получаем все необходимые данные одним запросом
+    price_data = get_batch_price_data(product_ids)
+    discount_data = get_batch_discount_data(subdomain, subdomain_pool, categories)
+    
+    # Рассчитываем цены для каждого продукта
+    products_array.map do |product|
+      base_price = price_data[product.id] || 0
+      final_price = calculate_local_price_with_discount(base_price, discount_data)
+      
+      {
+        product: product,
+        calculated_price: final_price,
+        base_price: base_price,
+        discount_applied: discount_data
+      }
+    end
+  end
+  
+  # Получаем базовые цены всех продуктов одним запросом
+  def self.get_batch_price_data(product_ids, dp_id = 1290)
+    return {} if product_ids.empty?
+    
+    # Кэшируем базовые цены на 30 минут
+    cache_key = "batch_prices_#{product_ids.sort.join('_')}_#{dp_id}"
+    
+    Padrino.cache(cache_key, expires_in: 1800) do # 30 минут
+      prices = {}
+      
+      # Получаем все product_complects одним запросом
+      ProductComplect.where(product_id: product_ids)
+                    .joins(:complect)
+                    .includes(:complect)
+                    .each do |pc|
+        complect = pc.complect
+        case dp_id
+        when 1290
+          prices[pc.product_id] = [prices[pc.product_id] || 0, complect.standart_price || 0].max
+        when 1990  
+          prices[pc.product_id] = [prices[pc.product_id] || 0, complect.small_price || 0].max
+        when 2890
+          prices[pc.product_id] = [prices[pc.product_id] || 0, complect.lux_price || 0].max
+        end
+      end
+      
+      prices
+    end
+  end
+  
+  # Рассчитываем финальную цену с учетом скидок
+  def self.calculate_local_price_with_discount(base_price, discount_data)
+    return base_price unless discount_data && base_price > 0
+    
+    if discount_data[:discount_in_per] && discount_data[:discount_in_per] > 0
+      base_price * (100 - discount_data[:discount_in_per]) / 100.0
+    elsif discount_data[:discount_in_ru] && discount_data[:discount_in_ru] > 0
+      [base_price - discount_data[:discount_in_ru], 0].max
+    else
+      base_price
+    end
+  end
+  
+  # Получаем данные о скидках одним запросом
+  def self.get_batch_discount_data(subdomain, subdomain_pool, categories)
+    # Кэшируем данные скидок на 1 час
+    cache_key = "discount_data_#{subdomain&.id}_#{subdomain_pool&.id}_#{categories&.map(&:id)&.sort&.join('_')}"
+    
+    Padrino.cache(cache_key, expires_in: 3600) do # 1 час
+      discount_data = {}
+      
+      # Получаем скидки субдомена
+      if subdomain
+        discount_data[:discount_in_per] = subdomain.discount_in_per || 0
+        discount_data[:discount_in_ru] = subdomain.discount_in_ru || 0
+      end
+      
+      # Получаем скидки субдомен пула (приоритет выше)
+      if subdomain_pool
+        discount_data[:discount_in_per] = subdomain_pool.discount_in_per || discount_data[:discount_in_per] || 0
+        discount_data[:discount_in_ru] = subdomain_pool.discount_in_ru || discount_data[:discount_in_ru] || 0
+      end
+      
+      discount_data
+    end
+  end
+  
+  # Применяем сортировку к массиву продуктов
+  def self.apply_sorting(products_array, sort_by)
+    case sort_by&.to_s
+    when 'price_asc'
+      products_array.sort_by { |p| p[:calculated_price] || 0 }
+    when 'price_desc'
+      products_array.sort_by { |p| -(p[:calculated_price] || 0) }
+    when 'title_asc'
+      products_array.sort_by { |p| p[:product].title || '' }
+    when 'title_desc'
+      products_array.sort_by { |p| -(p[:product].title || '') }
+    when 'created_desc'
+      products_array.sort_by { |p| -(p[:product].created_at&.to_i || 0) }
+    else
+      # По умолчанию: по популярности или ID
+      products_array.sort_by { |p| -(p[:product].id || 0) }
+    end
+  end
+  
+  # ОПТИМИЗИРОВАННЫЙ ПОИСК - заменяет медленный Product.all.select
+  def self.search_optimized(query, limit = 50)
+    return [] if query.blank?
+    
+    # Кэшируем поисковые запросы на 5 минут
+    cache_key = "search_opt_#{Digest::MD5.hexdigest(query.to_s)}_#{limit}"
+    
+    Padrino.cache(cache_key, expires_in: 300) do # 5 минут
+      sanitized_query = ActiveRecord::Base.connection.quote_string(query.to_s)
+      
+      # Используем FULLTEXT поиск если индекс создан, иначе LIKE
+      if mysql_fulltext_available?
+        # FULLTEXT поиск (намного быстрее для больших таблиц)
+        Product.where("MATCH(title, header) AGAINST(? IN BOOLEAN MODE)", "*#{sanitized_query}*")
+               .limit(limit)
+               .includes(:categories, :tags)
+      else
+        # Fallback на оптимизированный LIKE с индексами
+        Product.where(
+          "title LIKE ? OR header LIKE ? OR keywords LIKE ?",
+          "%#{sanitized_query}%",
+          "%#{sanitized_query}%", 
+          "%#{sanitized_query}%"
+        ).limit(limit)
+         .includes(:categories, :tags)
+      end.to_a
+    end
+  end
+  
+  # Проверяем доступность FULLTEXT индекса
+  def self.mysql_fulltext_available?
+    @fulltext_available ||= begin
+      ActiveRecord::Base.connection.execute(
+        "SHOW INDEX FROM products WHERE Key_name = 'idx_products_fulltext'"
+      ).any?
+    rescue
+      false
+    end
+  end
+  
+  # КЭШИРОВАННЫЕ МЕТОДЫ ЭКЗЕМПЛЯРА - заменяют часто вызываемые методы
+  
+  # Кэшированная базовая цена
+  def base_price_cached
+    @base_price_cache ||= begin
+      cache_key = "product_base_price_#{self.id}_#{self.updated_at&.to_i}"
+      Padrino.cache(cache_key, expires_in: 1800) do # 30 минут
+        base_price # вызываем оригинальный метод
+      end
+    end
+  end
+  
+  # Кэшированное изображение превью
+  def thumb_image_cached(mobile = nil)
+    @thumb_image_cache ||= {}
+    cache_key = mobile ? 'mobile' : 'desktop'
+    
+    @thumb_image_cache[cache_key] ||= begin
+      cache_key_full = "product_thumb_#{self.id}_#{cache_key}_#{self.updated_at&.to_i}"
+      Padrino.cache(cache_key_full, expires_in: 3600) do # 1 час
+        thumb_image(mobile) # вызываем оригинальный метод
+      end
+    end
+  end
+  
+  # Метод для очистки кэша продукта при обновлении
+  after_update :clear_product_cache
+  
+  private
+  
+  def clear_product_cache
+    @base_price_cache = nil
+    @thumb_image_cache = nil
+  end
 end
 
 class CategoriesProducts < ActiveRecord::Base
